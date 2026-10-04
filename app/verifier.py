@@ -18,7 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from heapq import heappop, heappush
 
-from .classfile import ClassFile, ClassFormatError, MethodInfo, parse_class
+from .classfile import (ClassFile, ClassFormatError, MethodInfo, parse_class,
+                        parse_stackmap_table)
 
 ACC_STATIC = 0x0008
 
@@ -374,6 +375,7 @@ class MethodVerifier:
         self.frames: dict[int, Frame] = {}
         self.insns: dict[int, Insn] = {}
         self.insns = decode(self.code_attr.code)
+        self.stackmap_results: list = []
         self._validate_exception_table()
 
     def _validate_exception_table(self) -> None:
@@ -681,6 +683,125 @@ class MethodVerifier:
 
         err("unknown-opcode", f"unhandled instruction {n}")  # unreachable
 
+    # -- declared-frame (StackMapTable) checking ---------------------------
+    #
+    # Runs only when the reviewer opts in, after the normal analysis has
+    # converged.  Offset deltas are expanded against the implicit initial
+    # frame of a static ()V method (no locals, empty stack); each expanded
+    # frame is then compared with the derived state at its absolute offset
+    # using the same merge semantics as control-flow joins.  Every problem
+    # is reported at the stable class-file offset of the offending frame
+    # (or verification_type_info item).
+
+    def check_declared_frames(self, data: bytes) -> list:
+        self.stackmap_results = []
+        sm = self.code_attr.stackmap
+        if sm is None:
+            return []
+        _attr_off, info_off, info_len = sm
+        declared = parse_stackmap_table(self.cf.cp, data, info_off, info_len)
+        prev_off = -1
+        prev_locals: tuple = ()
+        for d in declared:
+            abs_off = (d.offset_delta if prev_off < 0
+                       else prev_off + d.offset_delta + 1)
+            locals_, stack = self._expand_declared(d, prev_locals)
+            if abs_off not in self.insns:
+                raise VerifyError(
+                    d.table_offset, "bad-stackmap-target",
+                    f"declared frame expands to code offset {abs_off}, which "
+                    f"is not the start of an instruction")
+            rlocals = [self._resolve_declared(t) for t in locals_]
+            rstack = [self._resolve_declared(t) for t in stack]
+            derived = self.frames.get(abs_off)
+            if derived is None:
+                raise VerifyError(
+                    d.table_offset, "stackmap-mismatch",
+                    f"declared frame targets code offset {abs_off}, which "
+                    f"has no reachable derived state")
+            self._compare_declared(d, abs_off, rlocals, rstack, derived)
+            self.stackmap_results.append({
+                "table_offset": d.table_offset,
+                "frame_type": d.frame_type,
+                "kind": d.kind,
+                "offset_delta": d.offset_delta,
+                "offset": abs_off,
+                "locals": [fmt(t) for t in rlocals],
+                "stack": [fmt(t) for t in rstack],
+                "derived_locals": [fmt(t) for t in derived.locals],
+                "derived_stack": [fmt(t) for t in derived.stack],
+            })
+            prev_off = abs_off
+            prev_locals = tuple(locals_)  # declared items, for expansion
+        return self.stackmap_results
+
+    def _expand_declared(self, d, prev_locals: tuple):
+        """Expand one compressed frame against the previous declared frame."""
+        if d.kind == "same":
+            return list(prev_locals), []
+        if d.kind == "same_locals_1_stack_item":
+            return list(prev_locals), [d.stack[0]]
+        if d.kind == "chop":
+            if d.chop > len(prev_locals):
+                raise VerifyError(
+                    d.table_offset, "bad-stackmap-chop",
+                    f"chop_frame removes {d.chop} local(s) but the previous "
+                    f"declared frame has only {len(prev_locals)}")
+            return list(prev_locals[:len(prev_locals) - d.chop]), []
+        if d.kind == "append":
+            return list(prev_locals) + list(d.locals), []
+        return list(d.locals), list(d.stack)  # full
+
+    def _resolve_declared(self, dt):
+        """Resolve a declared type; uninitialized items gain their identity."""
+        t, item_off = dt.type, dt.item_offset
+        if t[0] != "uninit":
+            return t
+        insn = self.insns.get(t[1])
+        if insn is None or insn.name != "new":
+            raise VerifyError(
+                item_off, "bad-stackmap-uninitialized",
+                f"Uninitialized_variable_info cites code offset {t[1]}, "
+                f"which is not a new instruction")
+        return UNINIT(t[1], cp_class_name(self.cf, insn.operands[0],
+                                          item_off))
+
+    def _compare_declared(self, d, abs_off: int, rlocals: list,
+                          rstack: list, derived: Frame) -> None:
+        if len(rlocals) > len(derived.locals):
+            raise VerifyError(
+                d.table_offset, "stackmap-mismatch",
+                f"declared frame has {len(rlocals)} local(s) but max_locals "
+                f"is {len(derived.locals)}")
+        for i, dt in enumerate(rlocals):
+            at = derived.locals[i]
+            if merge_types(dt, at) is None:
+                raise VerifyError(
+                    d.table_offset, "stackmap-mismatch",
+                    f"local {i} at offset {abs_off}: declared {fmt(dt)} is "
+                    f"incompatible with the derived {fmt(at)}")
+        # Slots the declared frame omits must be unusable in the derived
+        # state; a compressed frame must not hide a live slot.
+        for i in range(len(rlocals), len(derived.locals)):
+            if derived.locals[i] != TOP:
+                raise VerifyError(
+                    d.table_offset, "stackmap-mismatch",
+                    f"local {i} at offset {abs_off} holds the derived "
+                    f"{fmt(derived.locals[i])} but the declared frame omits "
+                    f"it (only {len(rlocals)} local(s) declared)")
+        if len(rstack) != len(derived.stack):
+            raise VerifyError(
+                d.table_offset, "stackmap-mismatch",
+                f"declared stack height {len(rstack)} differs from the "
+                f"derived stack height {len(derived.stack)} at offset "
+                f"{abs_off}")
+        for i, (dt, at) in enumerate(zip(rstack, derived.stack)):
+            if merge_types(dt, at) is None:
+                raise VerifyError(
+                    d.table_offset, "stackmap-mismatch",
+                    f"operand stack slot {i} at offset {abs_off}: declared "
+                    f"{fmt(dt)} is incompatible with the derived {fmt(at)}")
+
     # -- result rendering --------------------------------------------------
 
     def states_json(self) -> list:
@@ -733,8 +854,15 @@ def _err(offset, kind, message, **extra):
 
 
 def verify_class(data: bytes, method_name: str | None = None,
-                 max_steps: int = DEFAULT_MAX_STEPS) -> dict:
-    """Verify one class file; always returns a result dict (never raises)."""
+                 max_steps: int = DEFAULT_MAX_STEPS,
+                 check_stackmap: bool = False) -> dict:
+    """Verify one class file; always returns a result dict (never raises).
+
+    With `check_stackmap` the Code attribute's StackMapTable is parsed and
+    every declared frame is checked against the derived type state; the
+    response then also carries a "stackmaps" list.  Without it the response
+    is exactly the one produced by the plain analysis.
+    """
     base = {"ok": False, "method": method_name, "states": [], "handlers": []}
     try:
         cf = parse_class(data)
@@ -792,6 +920,16 @@ def verify_class(data: bytes, method_name: str | None = None,
             base["states"] = v.states_json()
             base["handlers"] = v.handlers_json()
         return base
+
+    if check_stackmap:
+        try:
+            base["stackmaps"] = v.check_declared_frames(data)
+        except (VerifyError, ClassFormatError) as e:
+            base["error"] = _err(e.offset, e.kind, e.message)
+            base["states"] = v.states_json()
+            base["handlers"] = v.handlers_json()
+            base["stackmaps"] = v.stackmap_results
+            return base
 
     base["ok"] = True
     base["error"] = None

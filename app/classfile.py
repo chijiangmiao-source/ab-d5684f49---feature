@@ -99,6 +99,10 @@ class CodeAttr:
     code: bytes
     exceptions: list
     attr_offset: int     # file offset of the Code attribute
+    # (attr_offset, info_offset, info_length) of the StackMapTable attribute,
+    # captured but not parsed; parsing is lazy (only on demand) so malformed
+    # tables never affect verification unless the reviewer opts in.
+    stackmap: tuple | None = None
 
 
 @dataclass
@@ -149,6 +153,7 @@ def _parse_code(r: Reader, alen: int, astart: int, cp: CpInfo) -> CodeAttr:
             sub.u2("exception start_pc"), sub.u2("exception end_pc"),
             sub.u2("exception handler_pc"), sub.u2("exception catch_type"),
             eoff))
+    stackmap = None
     for _ in range(sub.u2("Code.attributes_count")):
         soff = sub.pos
         sname = cp.expect(sub.u2("code attribute name_index"), "Utf8",
@@ -159,6 +164,8 @@ def _parse_code(r: Reader, alen: int, astart: int, cp: CpInfo) -> CodeAttr:
                 soff, "truncated-attribute",
                 f'Code attribute "{sname}" declares {slen} byte(s) but only '
                 f"{sub.end - sub.pos} remain inside the Code attribute")
+        if sname == "StackMapTable" and stackmap is None:
+            stackmap = (soff, sub.pos, slen)
         sub.take(slen, f'code attribute "{sname}"')
     if sub.pos != end:
         raise ClassFormatError(
@@ -166,7 +173,7 @@ def _parse_code(r: Reader, alen: int, astart: int, cp: CpInfo) -> CodeAttr:
             f"Code attribute declares {alen} byte(s) but its content uses "
             f"{sub.pos - (end - alen)}")
     r.pos = end
-    return CodeAttr(max_stack, max_locals, code, exceptions, astart)
+    return CodeAttr(max_stack, max_locals, code, exceptions, astart, stackmap)
 
 
 def parse_class(data: bytes) -> ClassFile:
@@ -286,3 +293,128 @@ def parse_class(data: bytes) -> ClassFile:
                                f"{r.end - r.pos} trailing byte(s) after the "
                                f"class file structure")
     return ClassFile(minor, major, cp, access, this_name, super_name, methods)
+
+
+# ---------------------------------------------------------------------------
+# StackMapTable (declared frames) — parsed lazily, only when the reviewer
+# enables declared-frame checking.  All problems carry the exact file offset.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DeclaredType:
+    """One verification_type_info entry.
+
+    `type` is a tuple shaped like the verifier's types: ("top",), ("int",),
+    ("float",), ("null",), ("ref", name) or ("uninit", new_offset) — the
+    latter carries only the `new` offset; the verifier resolves it to the
+    full uninitialized identity during comparison.
+    """
+    type: tuple
+    item_offset: int     # file offset of this verification_type_info
+
+
+@dataclass
+class DeclaredFrame:
+    """One stack_map_frame entry, still in compressed (delta) form."""
+    table_offset: int    # file offset of the frame_type byte
+    frame_type: int
+    kind: str            # same|same_locals_1_stack_item|chop|append|full
+    offset_delta: int
+    chop: int            # locals removed (chop frames only)
+    locals: list         # DeclaredType (append/full frames)
+    stack: list          # DeclaredType (same_locals_1_stack_item/full)
+
+
+def _parse_verification_type(r: Reader, cp: CpInfo) -> DeclaredType:
+    off = r.pos
+    tag = r.u1("verification_type_info tag")
+    if tag == 0:
+        return DeclaredType(("top",), off)
+    if tag == 1:
+        return DeclaredType(("int",), off)
+    if tag == 2:
+        return DeclaredType(("float",), off)
+    if tag in (3, 4):
+        raise ClassFormatError(
+            off, "unsupported-verification-type",
+            f"{'Long' if tag == 3 else 'Double'}_variable_info is outside "
+            f"the supported scope")
+    if tag == 5:
+        return DeclaredType(("null",), off)
+    if tag == 6:
+        raise ClassFormatError(
+            off, "unsupported-verification-type",
+            "UninitializedThis_variable_info cannot appear in a static "
+            "method frame")
+    if tag == 7:
+        cpioff = r.pos
+        idx = r.u2("Object_variable_info cpool_index")
+        name = cp.expect(
+            cp.expect(idx, "Class", "Object_variable_info cpool_index",
+                      cpioff)[1],
+            "Utf8", "Object_variable_info class name", cpioff)[1]
+        return DeclaredType(("ref", name), off)
+    if tag == 8:
+        newoff = r.u2("Uninitialized_variable_info offset")
+        return DeclaredType(("uninit", newoff), off)
+    raise ClassFormatError(off, "unknown-verification-type",
+                           f"unknown verification_type_info tag {tag}")
+
+
+def parse_stackmap_table(cp: CpInfo, data: bytes, info_offset: int,
+                         info_len: int) -> list:
+    """Parse a StackMapTable attribute body into DeclaredFrame records.
+
+    `info_offset`/`info_len` locate the attribute body inside the class file
+    `data`, so every error offset is a stable class-file byte offset.
+    """
+    end = info_offset + info_len
+    r = Reader(data, info_offset, end, kind="truncated-attribute")
+    count = r.u2("StackMapTable number_of_entries")
+    frames = []
+    for _ in range(count):
+        foff = r.pos
+        ft = r.u1("stack_map_frame frame_type")
+        if ft <= 63:                                   # same_frame
+            frames.append(DeclaredFrame(foff, ft, "same", ft, 0, [], []))
+        elif ft <= 127:                                # same_locals_1_stack_item
+            item = _parse_verification_type(r, cp)
+            frames.append(DeclaredFrame(
+                foff, ft, "same_locals_1_stack_item", ft - 64, 0, [], [item]))
+        elif ft <= 246:
+            raise ClassFormatError(
+                foff, "unknown-stackmap-frame",
+                f"stack_map_frame frame_type {ft} is reserved")
+        elif ft == 247:            # same_locals_1_stack_item_frame_extended
+            delta = r.u2("same_locals_1_stack_item_frame_extended "
+                         "offset_delta")
+            item = _parse_verification_type(r, cp)
+            frames.append(DeclaredFrame(
+                foff, ft, "same_locals_1_stack_item", delta, 0, [], [item]))
+        elif ft <= 250:                              # chop_frame
+            delta = r.u2("chop_frame offset_delta")
+            frames.append(DeclaredFrame(foff, ft, "chop", delta,
+                                        251 - ft, [], []))
+        elif ft == 251:                              # same_frame_extended
+            delta = r.u2("same_frame_extended offset_delta")
+            frames.append(DeclaredFrame(foff, ft, "same", delta, 0, [], []))
+        elif ft <= 254:                              # append_frame
+            delta = r.u2("append_frame offset_delta")
+            locals_ = [_parse_verification_type(r, cp)
+                       for _ in range(ft - 251)]
+            frames.append(DeclaredFrame(foff, ft, "append", delta, 0,
+                                        locals_, []))
+        else:                                        # full_frame
+            delta = r.u2("full_frame offset_delta")
+            locals_ = [_parse_verification_type(r, cp)
+                       for _ in range(r.u2("full_frame number_of_locals"))]
+            stack = [_parse_verification_type(r, cp)
+                     for _ in range(r.u2("full_frame number_of_stack_items"))]
+            frames.append(DeclaredFrame(foff, ft, "full", delta, 0,
+                                        locals_, stack))
+    if r.pos != end:
+        raise ClassFormatError(
+            r.pos, "attribute-length-mismatch",
+            f"StackMapTable declares {count} frame(s) but {end - r.pos} "
+            f"trailing byte(s) remain in the attribute")
+    return frames

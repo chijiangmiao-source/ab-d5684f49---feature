@@ -13,7 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.server import make_server  # noqa: E402
 from builder import (ClassBuilder, legal_construction_class,  # noqa: E402
-                     uninitialized_escape_class)
+                     stackmap_mismatch_class, stackmap_pass_class,
+                     u1, u2, uninitialized_escape_class)
 
 
 def b64(data):
@@ -133,6 +134,55 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(res["ok"], res.get("error"))
         self.assertEqual(res["method"], "mb")
+
+    def test_check_stackmap_pass_reports_frames(self):
+        status, res = self.post({"class_b64": b64(stackmap_pass_class()),
+                                 "check_stackmap": True})
+        self.assertEqual(status, 200)
+        self.assertTrue(res["ok"], res.get("error"))
+        self.assertEqual(len(res["stackmaps"]), 2)
+        f1 = res["stackmaps"][0]
+        self.assertEqual(f1["kind"], "append")
+        self.assertEqual(f1["offset"], 11)
+        self.assertIsInstance(f1["table_offset"], int)
+        self.assertEqual(f1["locals"], f1["derived_locals"])
+
+    def test_check_stackmap_mismatch_locates_frame(self):
+        status, res = self.post({"class_b64": b64(stackmap_mismatch_class()),
+                                 "check_stackmap": True})
+        self.assertEqual(status, 200)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "stackmap-mismatch")
+        self.assertIsInstance(res["error"]["offset"], int)
+        self.assertEqual(len(res["stackmaps"]), 1)  # frames checked so far
+
+    def test_check_stackmap_off_keeps_response_compatible(self):
+        data = b64(stackmap_mismatch_class())
+        status, res = self.post({"class_b64": data})
+        self.assertEqual(status, 200)
+        self.assertTrue(res["ok"], res.get("error"))
+        self.assertNotIn("stackmaps", res)
+        status, res = self.post({"class_b64": data, "check_stackmap": False})
+        self.assertEqual(status, 200)
+        self.assertTrue(res["ok"], res.get("error"))
+        self.assertNotIn("stackmaps", res)
+
+    def test_check_stackmap_must_be_boolean(self):
+        status, res = self.post({"class_b64": b64(legal_construction_class()),
+                                 "check_stackmap": "yes"})
+        self.assertEqual(status, 400)
+        self.assertEqual(res["error"]["kind"], "bad-request")
+
+    def test_check_stackmap_malformed_table_rejected(self):
+        b = ClassBuilder()
+        b.add_method("run", bytes([0xB1]), max_stack=0, max_locals=0,
+                     stackmap=u2(2) + u1(0))  # truncated frame sequence
+        status, res = self.post({"class_b64": b64(b.build()),
+                                 "check_stackmap": True})
+        self.assertEqual(status, 200)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "truncated-attribute")
+        self.assertIsInstance(res["error"]["offset"], int)
 
 
 if __name__ == "__main__":

@@ -128,19 +128,72 @@ class ClassBuilder:
         self.marks = {}
 
     def add_method(self, name, code, max_stack=8, max_locals=4, exceptions=(),
-                   desc="()V", access=ACC_PUBLIC | ACC_STATIC):
+                   desc="()V", access=ACC_PUBLIC | ACC_STATIC, stackmap=None):
         self.methods.append({
             "name": name, "code": bytes(code), "max_stack": max_stack,
             "max_locals": max_locals, "exceptions": list(exceptions),
-            "desc": desc, "access": access,
+            "desc": desc, "access": access, "stackmap": stackmap,
         })
         return len(self.methods) - 1
+
+    # -- StackMapTable helpers ---------------------------------------------
+
+    _VTI_TAGS = {"top": 0, "int": 1, "float": 2, "null": 5}
+
+    def _vti(self, t):
+        """Encode one verification_type_info from a tuple like ("int",),
+        ("null",), ("ref", "a/b/C") or ("uninit", new_offset)."""
+        if t[0] in self._VTI_TAGS:
+            return u1(self._VTI_TAGS[t[0]])
+        if t[0] == "ref":
+            return u1(7) + u2(self.cp.cls(t[1]))
+        if t[0] == "uninit":
+            return u1(8) + u2(t[1])
+        raise AssertionError(t)
+
+    def smt(self, *frames):
+        """Build StackMapTable attribute info bytes.
+
+        Frames: ("same", delta) | ("same1", delta, vti) |
+        ("chop", delta, k) | ("append", delta, [vti...]) |
+        ("full", delta, [locals...], [stack...]) | ("raw", bytes).
+        Compact/extended forms are chosen automatically by delta size.
+        """
+        out = [u2(len(frames))]
+        for f in frames:
+            kind = f[0]
+            if kind == "raw":
+                out.append(bytes(f[1]))
+            elif kind == "same":
+                delta = f[1]
+                out.append(u1(delta) if delta < 64 else u1(251) + u2(delta))
+            elif kind == "same1":
+                delta, item = f[1], f[2]
+                out.append(u1(64 + delta) if delta < 64
+                           else u1(247) + u2(delta))
+                out.append(self._vti(item))
+            elif kind == "chop":
+                out.append(u1(251 - f[2]) + u2(f[1]))
+            elif kind == "append":
+                out.append(u1(251 + len(f[2])) + u2(f[1]))
+                out += [self._vti(t) for t in f[2]]
+            elif kind == "full":
+                out.append(u1(255) + u2(f[1]) + u2(len(f[2])))
+                out += [self._vti(t) for t in f[2]]
+                out.append(u2(len(f[3])))
+                out += [self._vti(t) for t in f[3]]
+            else:
+                raise AssertionError(kind)
+        return b"".join(out)
 
     def build(self):
         cp = self.cp
         this_idx = cp.cls(self.this_name)
         super_idx = cp.cls(self.super_name)
         code_utf = cp.utf8("Code")
+        smt_utf = (cp.utf8("StackMapTable")
+                   if any(m["stackmap"] is not None for m in self.methods)
+                   else None)
         for m in self.methods:
             m["name_idx"] = cp.utf8(m["name"])
             m["desc_idx"] = cp.utf8(m["desc"])
@@ -162,13 +215,23 @@ class ClassBuilder:
             body += u2(len(m["exceptions"]))
             for (s, e, h, _), ci in zip(m["exceptions"], m["catch_idx"]):
                 body += u2(s) + u2(e) + u2(h) + u2(ci)
-            body += u2(0)  # Code attributes
+            if m["stackmap"] is not None:
+                body += u2(1)  # one Code attribute
+                body += u2(smt_utf) + u4(len(m["stackmap"])) + m["stackmap"]
+            else:
+                body += u2(0)  # Code attributes
             out += u2(m["access"]) + u2(m["name_idx"]) + u2(m["desc_idx"])
             out += u2(1)  # one attribute
             self.marks[f"method{i}.attr_name_off"] = len(out)
             out += u2(code_utf)
             self.marks[f"method{i}.attr_len_off"] = len(out)
             out += u4(len(body))
+            if m["stackmap"] is not None:
+                # info starts after max_stack/max_locals/code_length/code/
+                # exception_table/attributes_count/attr_name/attr_length
+                self.marks[f"method{i}.smt_info_off"] = (
+                    len(out) + 2 + 2 + 4 + len(m["code"]) + 2
+                    + 8 * len(m["exceptions"]) + 2 + 2 + 4)
             out += body
         out += u2(0)  # class attributes
         return bytes(out)
@@ -216,3 +279,46 @@ def uninitialized_escape_class():
     b.add_method("run", a.build(), max_stack=2, max_locals=1,
                  exceptions=[(0, 10, 10, 0)])
     return b.build()
+
+
+def _stackmap_fixture(mismatch):
+    """A verifying class with a StackMapTable: an append frame carrying the
+    uninitialized identity new@0, then a full frame after <init> completed.
+    With `mismatch` the second frame declares int instead of the reference.
+    """
+    b = ClassBuilder("Smt")
+    x = b.cp.cls("com/acme/Diag")
+    init = b.cp.methodref("com/acme/Diag", "<init>", "()V")
+    a = Asm()
+    a.op(0xBB).u2(x)       # 0 new
+    a.op(0x4B)             # 3 astore_0   (uninitialized -> local 0)
+    a.op(0x03)             # 4 iconst_0
+    a.branch(0x99, "j")    # 5 ifeq j
+    a.branch(0xA7, "j")    # 8 goto j
+    a.label("j")           # 11
+    a.op(0x2A)             # 11 aload_0
+    a.op(0xB7).u2(init)    # 12 invokespecial <init>
+    a.op(0x03)             # 15 iconst_0
+    a.branch(0x99, "k")    # 16 ifeq k
+    a.op(0xB1)             # 19 return
+    a.label("k")           # 20
+    a.op(0x2A)             # 20 aload_0
+    a.op(0x57)             # 21 pop
+    a.op(0xB1)             # 22 return
+    code = a.build()
+    j, k = a.labels["j"], a.labels["k"]
+    declared = ("int",) if mismatch else ("ref", "com/acme/Diag")
+    sm = b.smt(("append", j, [("uninit", 0)]),
+               ("full", k - j - 1, [declared], []))
+    b.add_method("run", code, max_stack=1, max_locals=1, stackmap=sm)
+    return b.build()
+
+
+def stackmap_pass_class():
+    """A passing class whose declared frames match the derived states."""
+    return _stackmap_fixture(False)
+
+
+def stackmap_mismatch_class():
+    """A class whose second declared frame contradicts the derived state."""
+    return _stackmap_fixture(True)

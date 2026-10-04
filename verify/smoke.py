@@ -15,7 +15,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
-from builder import legal_construction_class, uninitialized_escape_class  # noqa: E402
+from builder import (legal_construction_class, stackmap_mismatch_class,  # noqa: E402
+                     stackmap_pass_class, uninitialized_escape_class)
 
 APP = os.environ.get("APP_URL", "http://app:8080").rstrip("/")
 
@@ -91,6 +92,30 @@ def main():
           status == 200 and res.get("ok") is False
           and err.get("kind") == "uninitialized-escapes-to-handler"
           and err.get("offset") == 4,
+          f"status={status} res={res}")
+
+    smt_ok = base64.b64encode(stackmap_pass_class()).decode("ascii")
+    status, res = post({"class_b64": smt_ok, "check_stackmap": True})
+    frames = res.get("stackmaps") or []
+    check("POST declared-frame check -> ok=true with per-frame evidence",
+          status == 200 and res.get("ok") is True and len(frames) == 2
+          and all(isinstance(f.get("table_offset"), int)
+                  and f.get("locals") == f.get("derived_locals")
+                  for f in frames),
+          f"status={status} res={res}")
+
+    smt_bad = base64.b64encode(stackmap_mismatch_class()).decode("ascii")
+    status, res = post({"class_b64": smt_bad, "check_stackmap": True})
+    err = res.get("error") or {}
+    check("POST declared-frame mismatch -> ok=false stackmap-mismatch",
+          status == 200 and res.get("ok") is False
+          and err.get("kind") == "stackmap-mismatch"
+          and isinstance(err.get("offset"), int),
+          f"status={status} res={res}")
+
+    status, res = post({"class_b64": smt_bad})
+    check("declared-frame check off -> response unchanged (no stackmaps key)",
+          status == 200 and res.get("ok") is True and "stackmaps" not in res,
           f"status={status} res={res}")
 
     status, res = post({"class_b64": "###not-base64###"})
