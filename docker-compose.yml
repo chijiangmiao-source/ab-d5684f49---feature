@@ -1,0 +1,33 @@
+# Review page + verifier API, and a one-shot `verify` service that runs the
+# unit tests and HTTP smoke checks, then exits with the result status code.
+#
+#   docker compose up --build --exit-code-from verify --abort-on-container-exit
+#
+# HOST_PORT picks the host port for the review page (default 8080):
+#   HOST_PORT=9090 docker compose up app
+services:
+  app:
+    build: .
+    image: fdiag-verifier:latest
+    environment:
+      PORT: "8080"
+    ports:
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=2)"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+
+  verify:
+    image: fdiag-verifier:latest
+    build: .
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_URL: "http://app:8080"
+    command: ["sh", "-c",
+              "python -m unittest discover -s tests -v && python verify/smoke.py"]

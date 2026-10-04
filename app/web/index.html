@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>诊断类载入前校验 · JVM ()V 静态方法</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 1080px; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; }
+  h2 { font-size: 1.05rem; margin-top: 1.6rem; }
+  textarea { width: 100%; box-sizing: border-box; font-family: ui-monospace, monospace;
+             font-size: .8rem; padding: .5rem; }
+  input, button { font: inherit; padding: .3rem .6rem; }
+  button { cursor: pointer; }
+  .row { display: flex; gap: .75rem; align-items: center; margin: .6rem 0; flex-wrap: wrap; }
+  .banner { padding: .6rem .9rem; border-radius: 6px; font-weight: 600; margin: 1rem 0; }
+  .pass { background: #dcf5dc; color: #145214; }
+  .fail { background: #fbdfdf; color: #7a1010; }
+  .warn { background: #fdf0d5; color: #7a4d00; }
+  table { border-collapse: collapse; width: 100%; font-family: ui-monospace, monospace; font-size: .78rem; }
+  th, td { border: 1px solid #9995; padding: .25rem .55rem; text-align: left; vertical-align: top; }
+  th { background: #8882; }
+  tr.unreachable td { opacity: .45; }
+  .muted { opacity: .7; font-size: .85rem; }
+  code { background: #8882; padding: 0 .3em; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h1>第三方诊断类载入前校验</h1>
+<p class="muted">粘贴单个 Base64 编码的 JVM class 文件（≤ 64 KiB）。校验器自行解析常量池与
+Code 属性，对目标静态 <code>()V</code> 方法按工作队列传播类型状态（正常边 + 异常边），
+输出逐偏移入栈状态、处理器入口状态，以及“通过”或首个拒绝证据（稳定定位到字节偏移）。
+未初始化对象仅按产生它的 <code>new</code> 偏移追踪：构造完成前不得进入处理器路径，
+也不得与已初始化引用合并。</p>
+<div class="row">
+  <label>目标方法（可选，静态 <code>()V</code>）：
+    <input id="method" size="14" placeholder="留空自动选择"></label>
+  <button id="go">提交校验</button>
+  <span id="meta" class="muted"></span>
+</div>
+<textarea id="b64" rows="10" spellcheck="false"
+  placeholder="yv66vgAAADQAMg..."></textarea>
+<div id="status"></div>
+<div id="error"></div>
+<h2>异常处理器入口状态</h2>
+<div id="handlers" class="muted">尚无结果</div>
+<h2>逐偏移入栈状态</h2>
+<div id="states" class="muted">尚无结果</div>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// 清除旧结论：输入变化或重新提交时，旧的通过/拒绝结论一律作废。
+function clearOld() {
+  for (const id of ['status', 'error']) $(id).innerHTML = '';
+  for (const id of ['handlers', 'states']) {
+    $(id).innerHTML = '<span class="muted">尚无结果</span>';
+    $(id).className = 'muted';
+  }
+  $('meta').textContent = '';
+}
+$('b64').addEventListener('input', clearOld);
+$('method').addEventListener('input', clearOld);
+
+function fmtSlots(v) { return v === null ? '—' : '[ ' + v.map(esc).join(', ') + ' ]'; }
+
+function renderTable(rows, heads) {
+  return '<table><thead><tr>' + heads.map(h => '<th>' + h + '</th>').join('') +
+    '</tr></thead><tbody>' + rows.join('') + '</tbody></table>';
+}
+
+function render(data, httpStatus) {
+  const st = $('status');
+  if (data.ok) {
+    st.innerHTML = '<div class="banner pass">通过：方法 <code>' +
+      esc(data.method) + '</code> 的类型状态收敛，无半初始化异常边。</div>';
+  } else if (httpStatus === 200) {
+    st.innerHTML = '<div class="banner fail">拒绝：首个拒绝证据见下。</div>';
+  } else {
+    st.innerHTML = '<div class="banner warn">请求错误（HTTP ' + httpStatus + '）。</div>';
+  }
+  if (data.error) {
+    const e = data.error;
+    $('error').innerHTML = renderTable([[
+      '<tr><td>' + (e.offset === null || e.offset === undefined ? '—' : e.offset) +
+      '</td><td>' + esc(e.kind) + '</td><td>' + esc(e.message) +
+      (e.candidates ? '（候选：' + e.candidates.map(esc).join(', ') + '）' : '') +
+      '</td></tr>']], ['偏移', '类别', '证据']);
+  }
+  if (data.handlers && data.handlers.length) {
+    $('handlers').className = '';
+    $('handlers').innerHTML = renderTable(data.handlers.map(h =>
+      '<tr class="' + (h.reachable ? '' : 'unreachable') + '"><td>[' + h.start_pc +
+      ', ' + h.end_pc + ')</td><td>' + h.handler_pc + '</td><td>' + esc(h.catch) +
+      '</td><td>' + fmtSlots(h.locals) + '</td><td>' + fmtSlots(h.stack) +
+      '</td></tr>'),
+      ['保护区间', 'handler_pc', '捕获类型', '局部变量', '操作数栈']);
+  }
+  if (data.states && data.states.length) {
+    $('states').className = '';
+    $('states').innerHTML = renderTable(data.states.map(s =>
+      '<tr class="' + (s.reachable ? '' : 'unreachable') + '"><td>' + s.offset +
+      '</td><td>' + esc(s.insn) + '</td><td>' + fmtSlots(s.locals) +
+      '</td><td>' + fmtSlots(s.stack) + '</td></tr>'),
+      ['偏移', '指令', '局部变量（入栈）', '操作数栈（入栈）']);
+  }
+  const bits = [];
+  if (data.class) bits.push('class ' + data.class);
+  if (data.method) bits.push('方法 ' + data.method);
+  if (data.max_locals !== undefined) bits.push('max_locals=' + data.max_locals);
+  if (data.max_stack !== undefined) bits.push('max_stack=' + data.max_stack);
+  $('meta').textContent = bits.join(' · ');
+}
+
+$('go').addEventListener('click', async () => {
+  clearOld();
+  const body = { class_b64: $('b64').value };
+  if ($('method').value.trim()) body.method = $('method').value.trim();
+  let data, status;
+  try {
+    const res = await fetch('/api/verify', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    status = res.status;
+    data = await res.json();
+  } catch (e) {
+    $('status').innerHTML = '<div class="banner warn">请求失败：' + esc(e) + '</div>';
+    return;
+  }
+  render(data, status);
+});
+</script>
+</body>
+</html>
