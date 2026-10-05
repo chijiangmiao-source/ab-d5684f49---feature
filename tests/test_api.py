@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from app.server import make_server  # noqa: E402
 from builder import (ClassBuilder, legal_construction_class,  # noqa: E402
+                     stackmap_legal_class, stackmap_mismatch_class,
                      uninitialized_escape_class)
 
 
@@ -133,6 +134,51 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(res["ok"], res.get("error"))
         self.assertEqual(res["method"], "mb")
+
+    def test_index_page_has_stackmap_toggle(self):
+        status, body = self.get("/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"checkStackmap", body)
+
+    def test_check_stackmap_off_keeps_response_compatible(self):
+        status, res = self.post({"class_b64": b64(stackmap_legal_class())})
+        self.assertEqual(status, 200)
+        self.assertTrue(res["ok"], res.get("error"))
+        self.assertNotIn("stackmap", res)
+
+    def test_check_stackmap_on_reports_declared_frames(self):
+        status, res = self.post({"class_b64": b64(stackmap_legal_class()),
+                                 "check_stackmap": True})
+        self.assertEqual(status, 200)
+        self.assertTrue(res["ok"], res.get("error"))
+        frames = res["stackmap"]["frames"]
+        self.assertEqual([f["offset"] for f in frames], [9, 11, 26, 28])
+        self.assertEqual(frames[3]["declared_locals"],
+                         ["int", "ref com/acme/Diag"])
+
+    def test_check_stackmap_mismatch_rejected(self):
+        status, res = self.post({"class_b64": b64(stackmap_mismatch_class()),
+                                 "check_stackmap": True})
+        self.assertEqual(status, 200)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "stackmap-mismatch")
+        self.assertEqual(res["error"]["offset"], 5)
+
+    def test_check_stackmap_malformed_table_rejected(self):
+        b = ClassBuilder()
+        b.add_method("run", bytes([0xB1]), max_stack=0, max_locals=0,
+                     stackmap=b"\xff\xff\xff")
+        status, res = self.post({"class_b64": b64(b.build()),
+                                 "check_stackmap": True})
+        self.assertEqual(status, 200)
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"]["kind"], "truncated-attribute")
+
+    def test_check_stackmap_non_boolean_rejected(self):
+        status, res = self.post({"class_b64": b64(legal_construction_class()),
+                                 "check_stackmap": "yes"})
+        self.assertEqual(status, 400)
+        self.assertEqual(res["error"]["kind"], "bad-request")
 
 
 if __name__ == "__main__":

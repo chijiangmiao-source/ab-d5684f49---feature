@@ -3,7 +3,8 @@
 Endpoints:
   GET  /            review page (paste Base64 class, view per-offset states)
   GET  /health      liveness probe -> {"status": "ok"}
-  POST /api/verify  {"class_b64": "...", "method": "optional-name"}
+  POST /api/verify  {"class_b64": "...", "method": "optional-name",
+                     "check_stackmap": false}
 """
 from __future__ import annotations
 
@@ -85,6 +86,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, _error(None, "bad-request",
                                    '"method" must be a string when given'))
             return
+        check_stackmap = obj.get("check_stackmap", False)
+        if not isinstance(check_stackmap, bool):
+            self._json(400, _error(None, "bad-request",
+                                   '"check_stackmap" must be a boolean when '
+                                   "given"))
+            return
         b64 = "".join(obj["class_b64"].split())  # tolerate pasted line wraps
         try:
             data = base64.b64decode(b64, validate=True)
@@ -98,7 +105,8 @@ class Handler(BaseHTTPRequestHandler):
                                    f"limit is {MAX_CLASS_BYTES} bytes "
                                    f"(64 KiB)"))
             return
-        self._json(200, verify_class(data, method))
+        self._json(200, verify_class(data, method,
+                                     check_stackmap=check_stackmap))
 
 
 def make_server(host: str = "0.0.0.0", port: int = 8080) -> ThreadingHTTPServer:

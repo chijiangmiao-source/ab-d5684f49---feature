@@ -18,7 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from heapq import heappop, heappush
 
-from .classfile import ClassFile, ClassFormatError, MethodInfo, parse_class
+from .classfile import (ClassFile, ClassFormatError, MethodInfo, Reader,
+                        parse_class)
 
 ACC_STATIC = 0x0008
 
@@ -122,6 +123,27 @@ def merge_frames(fa: Frame, fb: Frame, offset: int) -> Frame:
                 f"control-flow join: {fmt(x)} vs {fmt(y)}")
         stack_out.append(m)
     return Frame(tuple(locals_out), tuple(stack_out))
+
+
+def declared_covers(declared, derived) -> bool:
+    """A declared (StackMapTable) slot must subsume the derived slot: the
+    derived type merges into the declared one without widening it.  Uses the
+    same type lattice as control-flow joins, so e.g. a declared reference
+    covers a derived null, a declared top covers anything, and an
+    uninitialized identity covers only itself (post-<init> the identity has
+    been replaced by the initialized reference, which no longer matches)."""
+    return merge_types(declared, derived) == declared
+
+
+@dataclass(frozen=True)
+class DeclaredFrame:
+    """One expanded stack_map_frame entry."""
+    table_offset: int   # file offset of this frame entry (the raw evidence)
+    frame_type: str     # same / same_locals_1_stack_item / chop / append / full
+    offset_delta: int
+    offset: int         # absolute bytecode offset the frame applies to
+    locals: tuple       # expanded declared locals (not padded to max_locals)
+    stack: tuple        # expanded declared operand stack
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +466,176 @@ class MethodVerifier:
                 self.frames[target] = merged
                 heappush(work, target)
 
+    # -- declared-frame (StackMapTable) checking ---------------------------
+
+    def check_declared_frames(self, data: bytes, out: list) -> None:
+        """Parse the Code StackMapTable and compare each declared frame with
+        the derived entry state at its target offset.
+
+        Appends one result dict per frame to `out` (partial evidence is kept
+        on failure); raises VerifyError / ClassFormatError at the first
+        problem, located at the file offset of the offending bytes (or, for
+        a declared/derived disagreement, at the target bytecode offset).
+        """
+        info = self.code_attr.stackmap
+        if info is None:
+            return
+        end = info.body_offset + info.body_length
+        r = Reader(data, info.body_offset, end, kind="truncated-attribute")
+        count = r.u2("StackMapTable.number_of_entries")
+        prev_locals: tuple = ()  # static ()V: the implicit initial frame is empty
+        prev_offset = -1
+        for i in range(count):
+            decl = self._read_declared_frame(r, i, prev_locals, prev_offset)
+            self._match_declared_frame(decl, out)
+            prev_locals, prev_offset = decl.locals, decl.offset
+        if r.pos != end:
+            raise ClassFormatError(
+                r.pos, "attribute-length-mismatch",
+                f"{end - r.pos} trailing byte(s) after the last "
+                f"stack_map_frame entry")
+
+    def _read_declared_frame(self, r: Reader, index: int,
+                             prev_locals: tuple,
+                             prev_offset: int) -> DeclaredFrame:
+        entry_off = r.pos
+        tag = r.u1(f"stack_map_frame[{index}] frame_type")
+        stack: tuple = ()
+        if tag <= 63:                # same_frame
+            ftype, delta, locals_ = "same", tag, prev_locals
+        elif tag <= 127:             # same_locals_1_stack_item_frame
+            ftype = "same_locals_1_stack_item"
+            delta, locals_ = tag - 64, prev_locals
+            stack = (self._read_verification_type(r),)
+        elif tag == 247:             # same_locals_1_stack_item_frame_extended
+            ftype = "same_locals_1_stack_item"
+            delta = r.u2("same_locals_1_stack_item_frame_extended "
+                         "offset_delta")
+            locals_ = prev_locals
+            stack = (self._read_verification_type(r),)
+        elif 248 <= tag <= 250:      # chop_frame
+            ftype = "chop"
+            delta = r.u2("chop_frame offset_delta")
+            k = 251 - tag
+            if k > len(prev_locals):
+                raise VerifyError(
+                    entry_off, "bad-stackmap-frame",
+                    f"chop_frame removes {k} local(s) but the previous "
+                    f"frame has only {len(prev_locals)}")
+            locals_ = prev_locals[:len(prev_locals) - k]
+        elif tag == 251:             # same_frame_extended
+            ftype = "same"
+            delta = r.u2("same_frame_extended offset_delta")
+            locals_ = prev_locals
+        elif 252 <= tag <= 254:      # append_frame
+            ftype = "append"
+            delta = r.u2("append_frame offset_delta")
+            locals_ = prev_locals + tuple(
+                self._read_verification_type(r) for _ in range(tag - 251))
+        elif tag == 255:             # full_frame
+            ftype = "full"
+            delta = r.u2("full_frame offset_delta")
+            locals_ = tuple(self._read_verification_type(r)
+                            for _ in range(r.u2("full_frame number_of_locals")))
+            stack = tuple(self._read_verification_type(r)
+                          for _ in range(r.u2("full_frame number_of_stack_items")))
+        else:
+            raise VerifyError(
+                entry_off, "unknown-stackmap-frame",
+                f"reserved stack_map_frame frame_type tag {tag}")
+        target = delta if prev_offset < 0 else prev_offset + delta + 1
+        if target not in self.insns:
+            raise VerifyError(
+                entry_off, "bad-stackmap-offset",
+                f"stack_map_frame[{index}] expands to bytecode offset "
+                f"{target}, which is not the start of an instruction")
+        if len(locals_) > self.code_attr.max_locals:
+            raise VerifyError(
+                entry_off, "bad-stackmap-frame",
+                f"stack_map_frame[{index}] declares {len(locals_)} local(s) "
+                f"but max_locals is {self.code_attr.max_locals}")
+        return DeclaredFrame(entry_off, ftype, delta, target, locals_, stack)
+
+    def _read_verification_type(self, r: Reader):
+        off = r.pos
+        tag = r.u1("verification_type_info tag")
+        if tag == 0:
+            return TOP
+        if tag == 1:
+            return INT
+        if tag == 2:
+            return FLOAT
+        if tag == 5:
+            return NULL
+        if tag == 7:
+            idx_off = r.pos
+            idx = r.u2("Object_variable_info cpool_index")
+            return REF(cp_class_name(self.cf, idx, idx_off))
+        if tag == 8:
+            pos = r.pos
+            new_off = r.u2("Uninitialized_variable_info offset")
+            insn = self.insns.get(new_off)
+            if insn is None or insn.name != "new":
+                raise VerifyError(
+                    pos, "bad-uninitialized-offset",
+                    f"Uninitialized_variable_info refers to bytecode offset "
+                    f"{new_off}, which is not a new instruction")
+            return UNINIT(new_off, cp_class_name(self.cf, insn.operands[0],
+                                                 pos))
+        if tag in (3, 4):
+            raise VerifyError(
+                off, "unsupported-verification-type",
+                "Long/Double verification types are outside the supported "
+                "scope")
+        if tag == 6:
+            raise VerifyError(
+                off, "unsupported-verification-type",
+                "UninitializedThis_variable_info only applies to instance "
+                "<init> methods, outside the supported scope")
+        raise VerifyError(off, "unknown-verification-type",
+                          f"unknown verification_type_info tag {tag}")
+
+    def _match_declared_frame(self, decl: DeclaredFrame, out: list) -> None:
+        derived = self.frames.get(decl.offset)
+        # Missing locals are implicitly top; pad only for the comparison.
+        padded = decl.locals + (TOP,) * (self.code_attr.max_locals
+                                         - len(decl.locals))
+        out.append({
+            "table_offset": decl.table_offset,
+            "frame_type": decl.frame_type,
+            "offset_delta": decl.offset_delta,
+            "offset": decl.offset,
+            "reachable": derived is not None,
+            "declared_locals": [fmt(t) for t in decl.locals],
+            "declared_stack": [fmt(t) for t in decl.stack],
+            "locals": ([fmt(t) for t in derived.locals]
+                       if derived is not None else None),
+            "stack": ([fmt(t) for t in derived.stack]
+                      if derived is not None else None),
+        })
+        if derived is None:
+            return  # unreachable: no derived state to contradict
+        if len(decl.stack) != len(derived.stack):
+            raise VerifyError(
+                decl.offset, "stackmap-mismatch",
+                f"declared frame (file offset {decl.table_offset}) has "
+                f"{len(decl.stack)} operand stack slot(s) but the derived "
+                f"state at offset {decl.offset} has {len(derived.stack)}")
+        for i, (d, t) in enumerate(zip(padded, derived.locals)):
+            if not declared_covers(d, t):
+                raise VerifyError(
+                    decl.offset, "stackmap-mismatch",
+                    f"local {i}: declared {fmt(d)} does not cover the "
+                    f"derived {fmt(t)} at offset {decl.offset} (frame at "
+                    f"file offset {decl.table_offset})")
+        for i, (d, t) in enumerate(zip(decl.stack, derived.stack)):
+            if not declared_covers(d, t):
+                raise VerifyError(
+                    decl.offset, "stackmap-mismatch",
+                    f"operand stack slot {i}: declared {fmt(d)} does not "
+                    f"cover the derived {fmt(t)} at offset {decl.offset} "
+                    f"(frame at file offset {decl.table_offset})")
+
     # -- instruction semantics -------------------------------------------
 
     def _successors(self, pc: int, insn: Insn, frame: Frame):
@@ -733,8 +925,15 @@ def _err(offset, kind, message, **extra):
 
 
 def verify_class(data: bytes, method_name: str | None = None,
-                 max_steps: int = DEFAULT_MAX_STEPS) -> dict:
-    """Verify one class file; always returns a result dict (never raises)."""
+                 max_steps: int = DEFAULT_MAX_STEPS,
+                 check_stackmap: bool = False) -> dict:
+    """Verify one class file; always returns a result dict (never raises).
+
+    With `check_stackmap` the Code StackMapTable (if any) is additionally
+    parsed and every declared frame is compared against the derived state at
+    its target offset; the response then carries a "stackmap" section.  With
+    the flag off the table is ignored and the response keeps its old shape.
+    """
     base = {"ok": False, "method": method_name, "states": [], "handlers": []}
     try:
         cf = parse_class(data)
@@ -793,8 +992,20 @@ def verify_class(data: bytes, method_name: str | None = None,
             base["handlers"] = v.handlers_json()
         return base
 
-    base["ok"] = True
-    base["error"] = None
     base["states"] = v.states_json()
     base["handlers"] = v.handlers_json()
+
+    if check_stackmap:
+        info = target.code.stackmap
+        sm = {"attribute_offset": info.attr_offset if info is not None else None,
+              "frames": []}
+        base["stackmap"] = sm
+        try:
+            v.check_declared_frames(data, sm["frames"])
+        except (ClassFormatError, VerifyError) as e:
+            base["error"] = _err(e.offset, e.kind, e.message)
+            return base
+
+    base["ok"] = True
+    base["error"] = None
     return base

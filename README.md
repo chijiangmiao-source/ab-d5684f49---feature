@@ -10,6 +10,10 @@
 核心目标：确认异常跳转**不会把半初始化对象或错误操作数栈带入处理器**，
 否则看似可载入的补丁会在故障路径崩溃。
 
+复核页另提供**“核对声明帧”开关**：开启后，除上述推导外还解析 Code 属性中的
+StackMapTable，把偏移增量展开为绝对指令边界，逐帧比对供应商声明的局部变量 /
+操作数栈与推导状态，防止压缩帧掩盖错误控制流；关闭时验证结论与响应保持原样。
+
 ## 验证规则
 
 - 自行解析 class 常量池与 `Code` 属性（`app/classfile.py`），不依赖任何外部库；
@@ -25,6 +29,30 @@
   （分析步数保险丝，默认 200000 步）；
 - 服务无状态，每次提交独立验证；页面在重新提交或修改输入时**清除旧结论**。
 
+## 声明帧核对（StackMapTable，可选）
+
+请求带 `"check_stackmap": true` 时，在推导验证通过后追加核对：
+
+- 支持 `same` / `same_locals_1_stack_item`（含 extended）/ `chop` / `append` /
+  `full` 帧形式，以及 Top、Integer、Float、Null、Object、
+  由 `new` 偏移标识的 Uninitialized 等 verification_type；
+- 偏移增量展开为绝对指令边界（首帧 = delta，后续 = 前一帧 + delta + 1），
+  帧目标必须是指令起点；
+- 逐槽比对：声明类型按**现有合并格**覆盖推导类型才算一致
+  （声明 `top` 覆盖一切、声明引用覆盖 `null`、未初始化身份只认同一 `new` 偏移；
+  构造完成后身份已替换为初始化引用，声明 Uninitialized 不再匹配）；
+- 响应新增 `stackmap` 段：`attribute_offset`（属性文件偏移）与逐帧
+  `table_offset`（原始位置）、`frame_type`、`offset_delta`、`offset`、
+  `declared_locals` / `declared_stack`（展开状态）、`locals` / `stack`
+  （对应推导状态，不可达时为 `null`）；
+- 首个问题即拒绝并稳定定位：`bad-stackmap-offset`（跳入指令中部 / 越界）、
+  `truncated-attribute`（压缩序列截断）、`bad-constant-index`（无效常量池项）、
+  `bad-uninitialized-offset`（未初始化偏移不对应 `new`）、
+  `unknown-stackmap-frame` / `unknown-verification-type` /
+  `unsupported-verification-type`、`bad-stackmap-frame`（chop 越界 /
+  局部变量数超 max_locals）、`stackmap-mismatch`（与可达推导状态槽位不一致，
+  定位于目标字节偏移）。结构性问题定位到帧在 class 文件中的字节偏移。
+
 ## 范围
 
 - 目标方法：静态 `()V`（多个时需用 `method` 字段指定）；无字段访问；
@@ -39,7 +67,7 @@
 | --- | --- |
 | `GET /` | 复核页 |
 | `GET /health` | `{"status":"ok"}` |
-| `POST /api/verify` `{"class_b64": "...", "method": "可选"}` | 见下 |
+| `POST /api/verify` `{"class_b64": "...", "method": "可选", "check_stackmap": false}` | 见下 |
 
 ```json
 {
@@ -57,14 +85,19 @@
 ```
 
 拒绝时 `ok=false` 且 `error={"offset": 4, "kind": "uninitialized-escapes-to-handler",
-"message": "..."}`（`states`/`handlers` 为已计算的部分证据）。请求级错误
-（非法 Base64、超过 64 KiB、缺字段）返回 4xx。主要 `kind`：
+"message": "..."}`（`states`/`handlers` 为已计算的部分证据；声明帧核对失败时
+`stackmap` 为已核对的帧）。请求级错误（非法 Base64、超过 64 KiB、缺字段、
+`check_stackmap` 非布尔）返回 4xx。主要 `kind`：
 `truncated` / `truncated-attribute` / `truncated-instruction`、
 `bad-branch-target`、`bad-handler-range`、`stack-height-mismatch`、
 `incompatible-types`、`uninitialized-escapes-to-handler`、
 `uninitialized-object-used`、`already-initialized`、`stack-underflow` /
 `stack-overflow`、`local-index-out-of-range`、`fall-off-end`、
-`unknown-opcode`、`non-converging`、`no-target-method` / `ambiguous-method`。
+`unknown-opcode`、`non-converging`、`no-target-method` / `ambiguous-method`，
+以及声明帧核对的 `bad-stackmap-offset` / `bad-stackmap-frame` /
+`bad-uninitialized-offset` / `unknown-stackmap-frame` /
+`unknown-verification-type` / `unsupported-verification-type` /
+`stackmap-mismatch`。
 
 ## 运行（Docker Compose）
 
@@ -85,7 +118,7 @@ HOST_PORT=9090 docker compose up app
 ## 本地开发（无 Docker）
 
 ```bash
-python3 -m unittest discover -s tests -v     # 47 个单元/API 测试
+python3 -m unittest discover -s tests -v     # 80 个单元/API 测试
 PORT=8080 python3 -m app.server &            # 启动服务
 APP_URL=http://127.0.0.1:8080 python3 verify/smoke.py   # 冒烟
 ```
@@ -93,8 +126,8 @@ APP_URL=http://127.0.0.1:8080 python3 verify/smoke.py   # 冒烟
 ## 布局
 
 ```
-app/classfile.py   class 解析（常量池 / Code / 异常表，截断定位）
-app/verifier.py    类型状态工作队列验证器（正常边 + 异常边）
+app/classfile.py   class 解析（常量池 / Code / 异常表 / StackMapTable 定位，截断定位）
+app/verifier.py    类型状态工作队列验证器（正常边 + 异常边）+ 声明帧核对
 app/server.py      HTTP 服务（stdlib，无第三方依赖）
 app/web/index.html 复核页
 tests/             class 构造器 + 单元测试 + API 测试

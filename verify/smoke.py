@@ -15,7 +15,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tests"))
 
-from builder import legal_construction_class, uninitialized_escape_class  # noqa: E402
+from builder import (legal_construction_class, stackmap_legal_class,  # noqa: E402
+                     stackmap_mismatch_class, uninitialized_escape_class)
 
 APP = os.environ.get("APP_URL", "http://app:8080").rstrip("/")
 
@@ -91,6 +92,30 @@ def main():
           status == 200 and res.get("ok") is False
           and err.get("kind") == "uninitialized-escapes-to-handler"
           and err.get("offset") == 4,
+          f"status={status} res={res}")
+
+    map_class = base64.b64encode(stackmap_legal_class()).decode("ascii")
+    status, res = post({"class_b64": map_class})
+    check("declared-frame toggle off -> ok=true, response keeps old shape",
+          status == 200 and res.get("ok") is True and "stackmap" not in res,
+          f"status={status} res={res}")
+
+    status, res = post({"class_b64": map_class, "check_stackmap": True})
+    frames = (res.get("stackmap") or {}).get("frames") or []
+    check("declared-frame toggle on -> ok=true with 4 expanded frames",
+          status == 200 and res.get("ok") is True and len(frames) == 4
+          and frames[0]["offset"] == 9 and frames[0]["frame_type"] == "same"
+          and frames[3]["frame_type"] == "full"
+          and frames[3]["locals"] == ["int", "ref com/acme/Diag"],
+          f"status={status} res={res}")
+
+    bad_map = base64.b64encode(stackmap_mismatch_class()).decode("ascii")
+    status, res = post({"class_b64": bad_map, "check_stackmap": True})
+    err = res.get("error") or {}
+    check("declared/derived mismatch -> ok=false, evidence at offset 5",
+          status == 200 and res.get("ok") is False
+          and err.get("kind") == "stackmap-mismatch"
+          and err.get("offset") == 5,
           f"status={status} res={res}")
 
     status, res = post({"class_b64": "###not-base64###"})

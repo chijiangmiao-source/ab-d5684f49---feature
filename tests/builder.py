@@ -128,11 +128,11 @@ class ClassBuilder:
         self.marks = {}
 
     def add_method(self, name, code, max_stack=8, max_locals=4, exceptions=(),
-                   desc="()V", access=ACC_PUBLIC | ACC_STATIC):
+                   desc="()V", access=ACC_PUBLIC | ACC_STATIC, stackmap=None):
         self.methods.append({
             "name": name, "code": bytes(code), "max_stack": max_stack,
             "max_locals": max_locals, "exceptions": list(exceptions),
-            "desc": desc, "access": access,
+            "desc": desc, "access": access, "stackmap": stackmap,
         })
         return len(self.methods) - 1
 
@@ -141,6 +141,9 @@ class ClassBuilder:
         this_idx = cp.cls(self.this_name)
         super_idx = cp.cls(self.super_name)
         code_utf = cp.utf8("Code")
+        sm_utf = (cp.utf8("StackMapTable")
+                  if any(m["stackmap"] is not None for m in self.methods)
+                  else None)
         for m in self.methods:
             m["name_idx"] = cp.utf8(m["name"])
             m["desc_idx"] = cp.utf8(m["desc"])
@@ -162,16 +165,108 @@ class ClassBuilder:
             body += u2(len(m["exceptions"]))
             for (s, e, h, _), ci in zip(m["exceptions"], m["catch_idx"]):
                 body += u2(s) + u2(e) + u2(h) + u2(ci)
-            body += u2(0)  # Code attributes
+            sub_count = 1 if m["stackmap"] is not None else 0
+            body += u2(sub_count)  # Code attributes
+            sm_body_rel = None
+            if m["stackmap"] is not None:
+                body += u2(sm_utf) + u4(len(m["stackmap"]))
+                sm_body_rel = len(body)
+                body += m["stackmap"]
             out += u2(m["access"]) + u2(m["name_idx"]) + u2(m["desc_idx"])
             out += u2(1)  # one attribute
             self.marks[f"method{i}.attr_name_off"] = len(out)
             out += u2(code_utf)
             self.marks[f"method{i}.attr_len_off"] = len(out)
             out += u4(len(body))
+            if sm_body_rel is not None:
+                self.marks[f"method{i}.stackmap_body_off"] = \
+                    len(out) + sm_body_rel
             out += body
         out += u2(0)  # class attributes
         return bytes(out)
+
+
+# ---------------------------------------------------------------------------
+# StackMapTable body builder (compressed frame forms) + verification types
+# ---------------------------------------------------------------------------
+
+def vt_top():
+    return b"\x00"
+
+
+def vt_int():
+    return b"\x01"
+
+
+def vt_float():
+    return b"\x02"
+
+
+def vt_null():
+    return b"\x05"
+
+
+def vt_object(cp_idx):
+    return b"\x07" + u2(cp_idx)
+
+
+def vt_uninit(offset):
+    return b"\x08" + u2(offset)
+
+
+class Sm:
+    """Builds a StackMapTable attribute body frame by frame."""
+
+    def __init__(self):
+        self.buf = bytearray()
+        self.count = 0
+
+    def same(self, delta, extended=False):
+        if not extended and delta <= 63:
+            self.buf.append(delta)
+        else:
+            self.buf += b"\xfb" + u2(delta)
+        self.count += 1
+        return self
+
+    def same1(self, delta, vti, extended=False):
+        if not extended and delta <= 63:
+            self.buf.append(64 + delta)
+            self.buf += vti
+        else:
+            self.buf += b"\xf7" + u2(delta) + vti
+        self.count += 1
+        return self
+
+    def chop(self, delta, k):
+        assert 1 <= k <= 3
+        self.buf.append(251 - k)
+        self.buf += u2(delta)
+        self.count += 1
+        return self
+
+    def append(self, delta, vtis):
+        assert 1 <= len(vtis) <= 3
+        self.buf.append(251 + len(vtis))
+        self.buf += u2(delta)
+        for v in vtis:
+            self.buf += v
+        self.count += 1
+        return self
+
+    def full(self, delta, locals_, stack):
+        self.buf += b"\xff" + u2(delta)
+        self.buf += u2(len(locals_))
+        for v in locals_:
+            self.buf += v
+        self.buf += u2(len(stack))
+        for v in stack:
+            self.buf += v
+        self.count += 1
+        return self
+
+    def build(self):
+        return u2(self.count) + bytes(self.buf)
 
 
 # ---------------------------------------------------------------------------
@@ -215,4 +310,62 @@ def uninitialized_escape_class():
     a.op(0xB1)             # 11 return
     b.add_method("run", a.build(), max_stack=2, max_locals=1,
                  exceptions=[(0, 10, 10, 0)])
+    return b.build()
+
+
+def stackmap_legal_class():
+    """A passing class carrying a truthful StackMapTable: same / append /
+    full frames whose expanded locals and stack match the derived states
+    (targets at bytecode offsets 9, 11, 26 and 28)."""
+    b = ClassBuilder("SmokeMap")
+    x = b.cp.cls("com/acme/Diag")
+    init = b.cp.methodref("com/acme/Diag", "<init>", "()V")
+    a = Asm()
+    a.op(0x03)              # 0 iconst_0
+    a.branch(0x99, "l1")    # 1 ifeq l1
+    a.op(0x04)              # 4 iconst_1
+    a.op(0x3B)              # 5 istore_0
+    a.branch(0xA7, "j1")    # 6 goto j1
+    a.label("l1")           # 9
+    a.op(0x05)              # 9 iconst_2
+    a.op(0x3B)              # 10 istore_0
+    a.label("j1")           # 11
+    a.op(0x03)              # 11 iconst_0
+    a.branch(0x99, "l2")    # 12 ifeq l2
+    a.op(0xBB).u2(x)        # 15 new
+    a.op(0x59)              # 18 dup
+    a.op(0xB7).u2(init)     # 19 invokespecial <init>
+    a.op(0x4C)              # 22 astore_1
+    a.branch(0xA7, "j2")    # 23 goto j2
+    a.label("l2")           # 26
+    a.op(0x01)              # 26 aconst_null
+    a.op(0x4C)              # 27 astore_1
+    a.label("j2")           # 28
+    a.op(0x1A)              # 28 iload_0
+    a.op(0x57)              # 29 pop
+    a.op(0xB1)              # 30 return
+    sm = (Sm()
+          .same(9)                                 # @9  locals []
+          .same(1)                                 # @11 locals []
+          .append(14, [vt_int()])                  # @26 locals [int]
+          .full(1, [vt_int(), vt_object(x)], []))  # @28 locals [int, Diag]
+    b.add_method("run", a.build(), max_stack=2, max_locals=2,
+                 stackmap=sm.build())
+    return b.build()
+
+
+def stackmap_mismatch_class():
+    """A rejected class: the declared frame claims local 0 is int at bytecode
+    offset 5, but the derived state there is null."""
+    b = ClassBuilder("BadMap")
+    a = Asm()
+    a.op(0x01)              # 0 aconst_null
+    a.op(0x4B)              # 1 astore_0
+    a.branch(0xA7, "j")     # 2 goto j
+    a.label("j")            # 5
+    a.op(0x2A)              # 5 aload_0
+    a.op(0x57)              # 6 pop
+    a.op(0xB1)              # 7 return
+    b.add_method("run", a.build(), max_stack=1, max_locals=1,
+                 stackmap=Sm().full(5, [vt_int()], []).build())
     return b.build()

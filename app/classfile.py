@@ -93,12 +93,26 @@ class ExceptionEntry:
 
 
 @dataclass
+class StackMapTableInfo:
+    """Raw location of a StackMapTable code attribute.
+
+    The body is stored nowhere: it is re-read from the class bytes on demand
+    (only when the reviewer enables the declared-frame check), so malformed
+    tables cannot affect a plain verification run.
+    """
+    attr_offset: int     # file offset of the attribute (its name_index)
+    body_offset: int     # file offset of the attribute body
+    body_length: int
+
+
+@dataclass
 class CodeAttr:
     max_stack: int
     max_locals: int
     code: bytes
     exceptions: list
     attr_offset: int     # file offset of the Code attribute
+    stackmap: StackMapTableInfo | None = None
 
 
 @dataclass
@@ -149,6 +163,7 @@ def _parse_code(r: Reader, alen: int, astart: int, cp: CpInfo) -> CodeAttr:
             sub.u2("exception start_pc"), sub.u2("exception end_pc"),
             sub.u2("exception handler_pc"), sub.u2("exception catch_type"),
             eoff))
+    stackmap = None
     for _ in range(sub.u2("Code.attributes_count")):
         soff = sub.pos
         sname = cp.expect(sub.u2("code attribute name_index"), "Utf8",
@@ -159,6 +174,8 @@ def _parse_code(r: Reader, alen: int, astart: int, cp: CpInfo) -> CodeAttr:
                 soff, "truncated-attribute",
                 f'Code attribute "{sname}" declares {slen} byte(s) but only '
                 f"{sub.end - sub.pos} remain inside the Code attribute")
+        if sname == "StackMapTable" and stackmap is None:
+            stackmap = StackMapTableInfo(soff, sub.pos, slen)
         sub.take(slen, f'code attribute "{sname}"')
     if sub.pos != end:
         raise ClassFormatError(
@@ -166,7 +183,7 @@ def _parse_code(r: Reader, alen: int, astart: int, cp: CpInfo) -> CodeAttr:
             f"Code attribute declares {alen} byte(s) but its content uses "
             f"{sub.pos - (end - alen)}")
     r.pos = end
-    return CodeAttr(max_stack, max_locals, code, exceptions, astart)
+    return CodeAttr(max_stack, max_locals, code, exceptions, astart, stackmap)
 
 
 def parse_class(data: bytes) -> ClassFile:
